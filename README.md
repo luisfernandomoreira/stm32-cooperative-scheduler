@@ -425,6 +425,67 @@ using AgendadorMini = AgendadorT<4, 2>; // 4 tarefas, 2 deferred slots
 
 ---
 
+## Configuração de Clock (TIM17)
+
+O scheduler usa o TIM17 como timer one-shot para o sleep inteligente. O prescaler é calculado para gerar um tick de **1 ms** a partir do clock do APB.
+
+### Clock padrão: 24 MHz (STM32C031 com HSI/2)
+
+```cpp
+// Dentro do namespace SleepTimerTIM17 — já configurado corretamente:
+constexpr uint32_t APB_CLOCK_HZ_ESPERADO {24000000U};
+constexpr uint32_t PSC_1KHZ              {23999U};   // 24000000 / 1000 - 1
+```
+
+Nenhuma alteração necessária se o APB clock for 24 MHz.
+
+### Usando outro clock
+
+Altere **as duas constantes juntas**. O `static_assert` interno garante que ficaram sincronizadas — se errar uma delas, o compilador avisa na hora:
+
+```
+error: static assertion failed: SleepTimerTIM17: PSC_1KHZ inconsistente com
+APB_CLOCK_HZ_ESPERADO. Recalcule: PSC_1KHZ = (APB_CLOCK_HZ_ESPERADO / 1000) - 1
+```
+
+**Fórmula:**
+```
+PSC_1KHZ = (APB_CLOCK_HZ_ESPERADO / 1000) - 1
+```
+
+| Clock APB | `APB_CLOCK_HZ_ESPERADO` | `PSC_1KHZ` |
+|-----------|------------------------|------------|
+| 12 MHz | `12000000U` | `11999U` |
+| **24 MHz** | **`24000000U`** | **`23999U`** ← padrão |
+| 48 MHz | `48000000U` | `47999U` |
+| 64 MHz | `64000000U` | `63999U` |
+
+**Exemplo para 48 MHz:**
+
+```cpp
+// Em Scheduler_v3_3.hpp, namespace SleepTimerTIM17:
+constexpr std::uint32_t APB_CLOCK_HZ_ESPERADO {48000000U};
+constexpr std::uint32_t PSC_1KHZ              {47999U};
+
+// O static_assert verifica automaticamente:
+// 47999 == (48000000 / 1000) - 1  ✓  compila
+```
+
+**Erro intencional para demonstrar o guard:**
+
+```cpp
+// Alterar APB sem recalcular PSC — erro de compilação imediato:
+constexpr std::uint32_t APB_CLOCK_HZ_ESPERADO {48000000U};
+constexpr std::uint32_t PSC_1KHZ              {23999U};   // ← errado!
+
+// static_assert falha:
+// 23999 != (48000000 / 1000) - 1  →  erro em tempo de compilação
+```
+
+> **Importante:** o PSC controla a resolução de 1 ms do sleep. Com PSC errado, todos os timeouts do scheduler (período das tarefas, watchdog) ficam com escala incorreta — o `static_assert` existe exatamente para tornar esse erro impossível de passar despercebido.
+
+---
+
 ## Requisitos
 
 | Componente | Versão mínima |

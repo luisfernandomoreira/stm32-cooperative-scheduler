@@ -140,10 +140,23 @@ namespace SchedulerConfig
 // ====================================================================
 namespace SleepTimerTIM17
 {
+    // Para usar outro clock, altere APB_CLOCK_HZ_ESPERADO e recalcule:
+    //   PSC_1KHZ = (APB_CLOCK_HZ_ESPERADO / 1000U) - 1U
+    //
+    // Exemplos:
+    //   12 MHz  ->  PSC = 11999
+    //   24 MHz  ->  PSC = 23999  (padrao STM32C031)
+    //   48 MHz  ->  PSC = 47999
     constexpr std::uint32_t APB_CLOCK_HZ_ESPERADO {24000000U};
     constexpr std::uint32_t PSC_1KHZ              {23999U};
     constexpr std::uint32_t ARR_MAX               {65534U};
     constexpr std::uint32_t NVIC_PRIO             {3U};
+
+    // Garante que PSC_1KHZ e APB_CLOCK_HZ_ESPERADO estao sincronizados.
+    // Se alterar um sem o outro, o erro de compilacao aparece aqui.
+    static_assert(PSC_1KHZ == (APB_CLOCK_HZ_ESPERADO / 1000U) - 1U,
+        "SleepTimerTIM17: PSC_1KHZ inconsistente com APB_CLOCK_HZ_ESPERADO. "
+        "Recalcule: PSC_1KHZ = (APB_CLOCK_HZ_ESPERADO / 1000) - 1");
 
     inline void armar(std::uint32_t ms) noexcept
     {
