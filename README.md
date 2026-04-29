@@ -2,7 +2,7 @@
 
 **Agendador cooperativo de tarefas para Cortex-M0+ com prioridade, grupos, deferred queue e sleep inteligente**
 
-> Desenvolvido e validado em produção no firmware BWK17 (lavadoras Brastemp) sobre STM32C031K6T6 — 32 KB Flash / 6 KB RAM.
+> Desenvolvido e validado em produção sobre STM32C031K6T6 — 32 KB Flash / 6 KB RAM.
 
 ---
 
@@ -457,4 +457,4 @@ MIT — consulte o arquivo `LICENSE`.
 
 ---
 
-*Desenvolvido para o firmware BWK17 (lavadoras Brastemp) pela equipe da Alpe Placas Eletrônicas / Metalúrgica Alado. Validado em produção sobre STM32C031K6T6.*
+*Validado em produção sobre STM32C031K6T6.*
