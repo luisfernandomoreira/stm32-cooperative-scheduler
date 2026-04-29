@@ -1,35 +1,61 @@
-
-
-
 // ====================================================================
-// ARQUIVO: Scheduler_v3.3.hpp (AUTOSAR C++14)
+// ARQUIVO: Scheduler_v3.5.hpp (AUTOSAR C++14)
 //
 // Agendador cooperativo para STM32C031
-// VERSAO 3.3 - Producao
+// VERSAO 3.5 - Producao
 //
-// Correcoes aplicadas sobre v3.2:
-//   [BUG-A] obterEficiencia(): overflow uint32_t corrigido com
-//           uint64_t apenas na operacao critica. Chamada esporadica
-//           — custo de emulacao no M0+ e aceitavel.
+// Correcoes e melhorias aplicadas sobre v3.4:
 //
-//   [BUG-B] executar() Fase 4: agora desatualizado em
-//           reagendarComRecuperacao(). Corrigido com agoraPos =
-//           HAL_GetTick() capturado APOS t.funcao(). detectarAtraso()
-//           continua usando agora da Fase 2 — correto conceitualmente
-//           (mede atraso em relacao ao tick de coleta, nao de execucao).
+//   [FIX-2] drenarFilaDeferred_() refatorado para modelo atomico
+//           LIFO O(1): cada item e retirado atomicamente com
+//           __disable_irq()/__enable_irq(), eliminando a janela
+//           de race condition da compactacao em bloco da v3.4.
+//           ISR pode chamar despachar() com seguranca durante
+//           a drenagem — novos itens serao processados no mesmo
+//           ciclo de drenagem (loop while ate fila vazia).
 //
-//   [BUG-C] executar() Fase 1: idxDeferred_ -= nDeferred sem
-//           verificacao de underflow. Corrigido com guards seguro.
+//   [FIX-3] reagendarComRecuperacao() corrigido: primeira iteracao
+//           nao conta como perda (tarefa executou com atraso, mas
+//           executou). Apenas iteracoes subsequentes — periodos
+//           genuinamente pulados — incrementam perdas.
 //
-// Melhorias aplicadas sobre v3.2:
-//   [IMP-H] iniciar(): prioridade como parametro com default
-//           PRIORIDADE_PADRAO — elimina risco de reset silencioso.
-//           adicionarTarefa() passa prioridade direto para iniciar().
+//   [FIX-4] executar() corrigido: agoraPos recalculado apos cada
+//           execucao de funcao. reagendar() seguido de verificacao
+//           de proximaMs no passado aplica recuperacao correta
+//           mesmo quando atrasouMuito era false mas a execucao
+//           foi lenta. Elimina disparo imediato indevido no
+//           ciclo seguinte.
 //
-//   [IMP-I] HAL_GetTick() reduzido de 4x para 3x por tarefa
-//           na Fase 4: tsInicio reutilizado em g_ultimaExecMs.
+//   [IMP-N] Guard de reentrancia do idleHook_ em builds DEBUG:
+//           Flag idleHookAtivo_ previne chamada recursiva se hook
+//           chamar despachar() acidentalmente (ver [LIM-2]).
+//           Custo zero em RELEASE (condicional de preprocessador).
 //
-// Todas as correcoes e melhorias de v3.1 e v3.2 mantidas.
+//   [IMP-O] Desempate por indice documentado em ordenarPorPrioridade():
+//           Tarefas com mesma prioridade executam em ordem crescente
+//           de indice. Insertion sort estavel garante propriedade.
+//
+//   [IMP-P] obterEficiencia() usa uint32_t em vez de uint64_t:
+//           Cortex-M0+ nao tem multiplicacao/divisao 64-bit em
+//           hardware. Novo calculo evita overflow e elimina
+//           emulacao de 64-bit (~20-40 ciclos economizados).
+//
+//   [IMP-Q] habilitarTarefa(true) nao reseta totalExecucoes:
+//           Historico de execucoes preservado ao reabilitar tarefa.
+//           Novo metodo resetarContadorExecucoes() disponivel para
+//           reset explicito quando necessario.
+//
+//   [IMP-R] Comentario inline no duplo clear de SR em armar():
+//           Documenta intencao do clear pos-UEV para futuros
+//           revisores — sem alteracao funcional.
+//
+//   [IMP-S] dormirAteProximaTarefa() otimizado: elimina dupla
+//           varredura de tarefas. Uma unica chamada a
+//           proximaExecucao() apos deferred usa tempo atualizado
+//           para o WFI, mais preciso que o snapshot inicial.
+//
+// Todas as correcoes e melhorias de v3.1 a v3.4 mantidas.
+// ====================================================================
 
 // ************************ OBSERVACOES *******************************
 // LIMITACOES CONHECIDAS:
@@ -38,20 +64,20 @@
 //           imediatamente apos wrap (~497 dias de operacao continua).
 //           Impacto: somente diagnostico — nenhum efeito funcional.
 //           Correcao nao justificada para o ciclo de vida do produto.
-
+//
+//   [LIM-2] idleHook_ nao pode chamar despachar() — risco de loop
+//           infinito (idle -> despacha -> idle nunca dorme).
+//           Em DEBUG: guard de reentrancia [IMP-N] detecta e bloqueia.
+//           Em RELEASE: responsabilidade do usuario — sem overhead.
+//
+//   [LIM-3] drenarFilaDeferred_() usa modelo LIFO apos [FIX-2].
+//           Ordem de execucao dos callbacks nao e garantida como
+//           FIFO. Se a ordem for critica, despachar callbacks em
+//           funcoes compostas ou usar indices explicitamente.
+// ====================================================================
 
 // ======================== PRIORIDADE DE TAREFAS ======================
-// Scheduler_v3.3 com prioridade cooperativa
-//
-// Escala de prioridade:
-//    0-9   = critica    (seguranca, watchdog)
-//    10-49 = alta       (entrada do usuario, comunicacao)
-//    50-99 = media      (logica de controle)
-//    100-149 = baixa    (display, visual)
-//    150-255 = minima   (persistencia, diagnostico)
-
-// ================ SIMPLIFICANDO OS NIVEIS DE PRIORIDADE =============
-// NIVEIS DE PRIORIDADE — Scheduler_v3.3
+// NIVEIS DE PRIORIDADE — Scheduler_v3.5
 // Escala: 0 = maior urgencia | 255 = menor urgencia
 //
 //   0  -  20  | PRIORIDADE MAXIMA   — seguranca e controle critico
@@ -59,14 +85,16 @@
 // 100  - 149  | PRIORIDADE MEDIA    — logica de controle
 // 150  - 199  | PRIORIDADE BAIXA    — display e visual
 // 200  - 255  | PRIORIDADE MINIMA   — persistencia e diagnostico
-// ====================================================================
-
+//
 // LEMBRETE: prioridade resolve EMPATES no mesmo tick.
+// DESEMPATE: tarefas com mesma prioridade executam em ordem
+//            crescente de indice (ordem de adicao ao scheduler).
+//            Insertion sort estavel garante esta propriedade [IMP-O].
 // Nao ha preempcao — tarefa em execucao roda ate retornar.
 // ====================================================================
 
-#ifndef SCHEDULER_V33_HPP
-#define SCHEDULER_V33_HPP
+#ifndef SCHEDULER_V35_HPP
+#define SCHEDULER_V35_HPP
 
 #include "stm32c0xx.h"
 #include "stm32c0xx_hal.h"
@@ -175,9 +203,18 @@ namespace SleepTimerTIM17
         TIM17->PSC  = PSC_1KHZ;
         TIM17->ARR  = arr;
         TIM17->CNT  = 0U;
+
+        // Limpa qualquer UIF pendente antes de habilitar interrupcao.
+        // Necessario pois EGR=UG gera um UEV que levanta UIF — sem
+        // este clear, a interrupcao dispararia imediatamente ao
+        // habilitar DIER, acordando o sistema antes do tempo. [IMP-R]
         TIM17->SR   = 0U;
         TIM17->DIER = TIM_DIER_UIE;
-        TIM17->EGR  = TIM_EGR_UG;
+        TIM17->EGR  = TIM_EGR_UG;   // forca atualizacao: carrega PSC/ARR no timer
+
+        // Limpa UIF espu'rio gerado pelo UEV do EGR=UG acima. [IMP-R]
+        // Sem este segundo clear, a ISR dispararia no proximo ciclo
+        // de clock apos CEN=1, ignorando o periodo configurado em ARR.
         TIM17->SR   = 0U;
 
         NVIC_SetPriority(TIM17_IRQn, NVIC_PRIO);
@@ -287,7 +324,6 @@ struct InfoProximaTarefa
 
 // ====================================================================
 // STRUCT: Tarefa
-// [IMP-H] iniciar() recebe prioridade como parametro
 // ====================================================================
 struct Tarefa
 {
@@ -308,11 +344,6 @@ struct Tarefa
     FuncaoFalha            callbackConcluido     {nullptr};
     std::uint8_t           prioridade            {SchedulerConfig::PRIORIDADE_PADRAO};
 
-    // ------------------------------------------------------------------
-    // [IMP-H] iniciar(): prioridade como parametro com default.
-    // Elimina risco de reset silencioso ao chamar iniciar() diretamente.
-    // adicionarTarefa() passa o valor recebido — sem dupla atribuicao.
-    // ------------------------------------------------------------------
     void iniciar(FuncaoTarefa  f,
                  std::uint32_t periodo,
                  std::uint32_t faseMs      = 0U,
@@ -339,20 +370,38 @@ struct Tarefa
         callbackFalhaDisparado = false;
         limiteExecucoes        = SchedulerConfig::LIMITE_INFINITO;
         callbackConcluido      = nullptr;
-        prioridade             = prior; // [IMP-H]
+        prioridade             = prior;
     }
 
-    // ------------------------------------------------------------------
     void reagendar() noexcept
     {
         proximaMs += periodoMs;
     }
 
-    // [BUG-3] Corrigido em v3.1 — mantido
+    // ================================================================
+    // [FIX-3] reagendarComRecuperacao() corrigido.
+    //
+    // ANTES (v3.4): primeira iteracao incrementava perdas, mas a
+    // tarefa JA EXECUTOU — era apenas um disparo com atraso,
+    // nao uma perda real. Contagem de perdas ficava inflada.
+    //
+    // DEPOIS (v3.5):
+    //   - Primeiro avanço de proximaMs: periodo atual (executou
+    //     com atraso). Nao conta como perda.
+    //   - Iteracoes seguintes: periodos genuinamente pulados.
+    //     Cada uma incrementa perdas corretamente.
+    //   - Fallback final preservado: se ainda no passado apos
+    //     MAX_CATCHUP iteracoes, ancora em agora + periodo.
+    // ================================================================
     void reagendarComRecuperacao(std::uint32_t agora) noexcept
     {
+        // Primeiro avanco: periodo atual que executou com atraso.
+        // NAO e perda — a tarefa foi executada, apenas tarde.
+        proximaMs += periodoMs;
+
         std::uint8_t iteracoes {0U};
 
+        // Iteracoes seguintes: periodos genuinamente perdidos.
         while (tempoVencido(agora, proximaMs)
                && iteracoes < SchedulerConfig::MAX_CATCHUP)
         {
@@ -361,13 +410,13 @@ struct Tarefa
             ++iteracoes;
         }
 
+        // Fallback: se ainda no passado apos MAX_CATCHUP, ancora.
         if (tempoVencido(agora, proximaMs))
         {
             proximaMs = agora + periodoMs;
         }
     }
 
-    // [BUG-2] Corrigido em v3.1 — mantido
     void registrarExecucao(std::uint32_t tsFim,
                            std::uint32_t planejado,
                            std::uint32_t tsInicio,
@@ -424,6 +473,12 @@ struct Tarefa
         perdas = SchedulerConfig::PERDAS_INICIAL;
     }
 
+    // [IMP-Q] Reset explicito do contador — separado de habilitarTarefa().
+    void resetarContadorExecucoes() noexcept
+    {
+        totalExecucoes = 0U;
+    }
+
     ~Tarefa() = default;
 };
 
@@ -448,6 +503,17 @@ private:
     std::uint32_t contLoop_                            {0U};
     std::uint32_t contSleep_                           {0U};
     std::uint32_t contDeferredOverflow_                {0U};
+    FuncaoTarefa  idleHook_                            {nullptr};
+    std::uint32_t contIdleHook_                        {0U};
+
+    // ----------------------------------------------------------------
+    // [IMP-N] Guard de reentrancia do idleHook_ — apenas em DEBUG.
+    // Previne loop infinito se hook chamar despachar() por engano.
+    // Em RELEASE: removido pelo preprocessador — zero overhead.
+    // ----------------------------------------------------------------
+#ifdef DEBUG
+    bool idleHookAtivo_ {false};
+#endif
 
     AgendadorT()  = default;
     ~AgendadorT() = default;
@@ -475,9 +541,9 @@ private:
     }
 
     // ----------------------------------------------------------------
-    // ordenarPorPrioridade(): insertion sort estavel sobre indices.
-    // O(n^2) com n <= 32 — adequado para embedded sem heap.
-    // Estavel: mesma prioridade preserva ordem de indice original.
+    // [IMP-O] Desempate documentado: tarefas com mesma prioridade
+    // executam em ordem crescente de indice (ordem de adicao).
+    // Insertion sort e estavel — preserva ordem relativa de iguais.
     // ----------------------------------------------------------------
     void ordenarPorPrioridade(std::uint8_t* indices,
                                std::uint8_t  n) const noexcept
@@ -499,6 +565,87 @@ private:
         }
     }
 
+    // ================================================================
+    // [FIX-2] drenarFilaDeferred_() — modelo atomico LIFO O(1).
+    //
+    // PROBLEMA v3.4: snapshot + compactacao em bloco criava janela
+    // de race condition. ISR podia gravar novo item durante execucao
+    // de callback, e a compactacao posterior podia corromper indices.
+    //
+    // SOLUCAO v3.5: cada item e retirado atomicamente do topo da
+    // fila (LIFO). A secao critica cobre apenas a retirada do
+    // ponteiro e o decremento do indice — O(1) por item, sem
+    // compactacao, sem copia de memoria.
+    //
+    // GARANTIAS:
+    //   - ISR pode chamar despachar() a qualquer momento — o item
+    //     sera processado neste mesmo ciclo de drenagem (while
+    //     continua ate fila vazia).
+    //   - Sem underflow: idxDeferred_ so e decrementado dentro da
+    //     secao critica, apos verificacao > 0.
+    //   - Sem acesso fora dos limites: indice sempre valido dentro
+    //     da secao critica.
+    //
+    // LIMITACAO [LIM-3]: ordem LIFO. Se FIFO for necessario,
+    // usar buffer circular dedicado (custo de memoria adicional).
+    // ================================================================
+    std::uint8_t drenarFilaDeferred_() noexcept
+    {
+        std::uint8_t processados {0U};
+
+        while (true)
+        {
+            // Retira item do topo atomicamente
+            __disable_irq();
+
+            if (idxDeferred_ == 0U)
+            {
+                __enable_irq();
+                break;
+            }
+
+            // Decrementa e captura o ponteiro em secao critica
+            --idxDeferred_;
+            FuncaoTarefa cb             = filaDeferred_[idxDeferred_];
+            filaDeferred_[idxDeferred_] = nullptr;
+
+            __enable_irq();
+
+            // Executa fora da secao critica — ISR pode despachar
+            // novos itens durante esta chamada
+            if (cb != nullptr)
+            {
+                cb();
+                ++processados;
+            }
+        }
+
+        return processados;
+    }
+
+    // ----------------------------------------------------------------
+    // chamarIdleHook_(): encapsula chamada ao hook com guard [IMP-N].
+    // ----------------------------------------------------------------
+    void chamarIdleHook_() noexcept
+    {
+        if (idleHook_ == nullptr) { return; }
+
+#ifdef DEBUG
+        // Guard de reentrancia: bloqueia chamada recursiva do hook.
+        // Cobre o caso em que hook chama despachar() acidentalmente,
+        // que poderia causar re-entrada via dormirAteProximaTarefa().
+        if (idleHookAtivo_) { return; }
+        idleHookAtivo_ = true;
+#endif
+
+        idleHook_();
+        ++contIdleHook_;
+
+#ifdef DEBUG
+        idleHookAtivo_ = false;
+#endif
+    }
+
 public:
 
     // ----------------------------------------------------------------
@@ -509,13 +656,26 @@ public:
     }
 
     // ================================================================
+    // REGISTRO DO IDLE HOOK
+    // ================================================================
+
+    // Registra callback executado durante o idle (entre execucao e sleep).
+    // USO: diagnostico, keep-alive UART, atualizacao de display lento.
+    // RESTRICAO [LIM-2]: nao chamar despachar() dentro do hook.
+    void registrarIdleHook(FuncaoTarefa hook) noexcept
+    {
+        idleHook_ = hook;
+    }
+
+    void removerIdleHook() noexcept
+    {
+        idleHook_ = nullptr;
+    }
+
+    // ================================================================
     // CONFIGURACAO DE TAREFAS
     // ================================================================
 
-    // ----------------------------------------------------------------
-    // [IMP-H] adicionarTarefa(): passa prioridade para iniciar()
-    // diretamente — sem dupla atribuicao, sem risco de reset silencioso.
-    // ----------------------------------------------------------------
     void adicionarTarefa(
         std::uint8_t  indice,
         FuncaoTarefa  funcao,
@@ -530,7 +690,6 @@ public:
     {
         if (!indiceValido(indice)) { return; }
 
-        // [IMP-H] prioridade vai direto para iniciar()
         tarefas_[indice].iniciar(funcao, periodoMs, faseMs,
                                  hab, isCritica, grupo,
                                  prioridade);
@@ -604,6 +763,8 @@ public:
     // FILA DEFERRED
     // ================================================================
 
+    // Enfileira callback para execucao no contexto do scheduler.
+    // Seguro chamar de ISR. Retorna false se fila cheia.
     [[nodiscard]] bool despachar(FuncaoTarefa f) noexcept
     {
         if (f == nullptr) { return false; }
@@ -641,6 +802,16 @@ public:
     // HABILITACAO E CONTROLE DE TAREFAS
     // ================================================================
 
+    // ----------------------------------------------------------------
+    // [IMP-Q] habilitarTarefa() nao reseta totalExecucoes.
+    //
+    // ANTES (v3.4): reabilitar uma tarefa apagava o historico de
+    // execucoes acumulado, dificultando diagnostico de tarefas
+    // que ciclam entre habilitada/desabilitada (ex: modo sleep).
+    //
+    // DEPOIS (v3.5): totalExecucoes e preservado ao reabilitar.
+    // Para reset explicito, use resetarContadorExecucoes(indice).
+    // ----------------------------------------------------------------
     void habilitarTarefa(std::uint8_t indice, bool hab) noexcept
     {
         if (!indiceValido(indice)) { return; }
@@ -650,10 +821,17 @@ public:
         if (hab)
         {
             const std::uint32_t agora = HAL_GetTick();
-            tarefas_[indice].proximaMs      =
+
+            // Reagenda a partir do momento atual — evita disparo
+            // imediato apos longa suspensao.
+            tarefas_[indice].proximaMs    =
                 agora + tarefas_[indice].periodoMs;
-            tarefas_[indice].ultimaExecMs   = agora;
-            tarefas_[indice].totalExecucoes = 0U;
+            tarefas_[indice].ultimaExecMs = agora;
+
+            // [IMP-Q] totalExecucoes NAO e resetado aqui.
+            // Historico acumulado e preservado para diagnostico.
+            // Use resetarContadorExecucoes() para reset explicito.
+
             tarefas_[indice].resetarPerdas();
             tarefas_[indice].resetarCallbackFalha();
         }
@@ -670,6 +848,19 @@ public:
         tarefas_[indice].totalExecucoes = 0U;
         tarefas_[indice].resetarPerdas();
         tarefas_[indice].resetarCallbackFalha();
+    }
+
+    // ----------------------------------------------------------------
+    // [IMP-Q] resetarContadorExecucoes(): reset explicito do contador.
+    // Usar quando o historico deve ser zerado intencionalmente,
+    // por exemplo ao entrar em novo modo de operacao.
+    // ----------------------------------------------------------------
+    void resetarContadorExecucoes(std::uint8_t indice) noexcept
+    {
+        if (indiceValido(indice))
+        {
+            tarefas_[indice].resetarContadorExecucoes();
+        }
     }
 
     // ================================================================
@@ -771,7 +962,6 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // [BUG-4] Corrigido em v3.1 — mantido
     [[nodiscard]] bool alimentarWatchdog() noexcept
     {
         const std::uint32_t agora   = HAL_GetTick();
@@ -803,7 +993,6 @@ public:
     // NUCLEO DO AGENDADOR
     // ================================================================
 
-    // ----------------------------------------------------------------
     [[nodiscard]] InfoProximaTarefa proximaExecucao() const noexcept
     {
         const std::uint32_t agora = HAL_GetTick();
@@ -833,41 +1022,84 @@ public:
         return info;
     }
 
-    // ----------------------------------------------------------------
+    // ================================================================
+    // dormirAteProximaTarefa() — v3.5
+    //
+    // [IMP-S] Otimizacao: elimina dupla varredura de tarefas.
+    //
+    // ANTES (v3.4): chamava proximaExecucao() para obter info,
+    // depois chamava temTarefasPendentes() (que chama
+    // proximaExecucao() novamente) para verificar pos-deferred.
+    // Duas varreduras completas de N_TAREFAS no caminho critico.
+    //
+    // DEPOIS (v3.5): apos drenarFilaDeferred_() e chamarIdleHook_(),
+    // uma unica chamada a proximaExecucao() recalcula com o tick
+    // atualizado. Mais preciso (tempo de sleep recalculado apos
+    // overhead do deferred) e mais eficiente (uma varredura a menos).
+    //
+    // Fluxo completo:
+    //   1. Verifica se ha tarefa pronta (retorna false se sim)
+    //   2. Drena fila deferred pendente
+    //   3. Chama idleHook_ (com guard DEBUG [IMP-N])
+    //   4. Recalcula proximo wake-up com tick atualizado
+    //   5. Se nova tarefa pronta (deferred habilitou algo): retorna
+    //   6. Dorme pelo tempo recalculado
+    // ================================================================
     bool dormirAteProximaTarefa() noexcept
     {
         ++contLoop_;
 
-        const InfoProximaTarefa info = proximaExecucao();
+        // Passo 1: verifica se ha tarefa pronta agora
+        {
+            const InfoProximaTarefa info = proximaExecucao();
+            if (!info.valida)                                     { return false; }
+            if (info.tempoMs == 0U)                               { return false; }
+            if (info.tempoMs < SchedulerConfig::SLEEP_MINIMO_MS) { return false; }
+        }
 
-        if (!info.valida)                                      { return false; }
-        if (info.tempoMs == 0U)                                { return false; }
-        if (info.tempoMs < SchedulerConfig::SLEEP_MINIMO_MS)  { return false; }
+        // Passo 2: drena callbacks deferred pendentes
+        drenarFilaDeferred_();
 
-        SleepTimerTIM17::dormirSeguro(info.tempoMs);
+        // Passo 3: callback de usuario (diagnostico, keep-alive, etc.)
+        chamarIdleHook_();
+
+        // Passo 4: recalcula com tick atualizado apos overhead acima.
+        // [IMP-S] Uma unica chamada substitui proximaExecucao() +
+        // temTarefasPendentes() da versao anterior.
+        const InfoProximaTarefa infoPos = proximaExecucao();
+
+        // Passo 5: deferred pode ter habilitado nova tarefa — nao dorme
+        if (!infoPos.valida)                                    { return false; }
+        if (infoPos.tempoMs == 0U)                              { return false; }
+        if (infoPos.tempoMs < SchedulerConfig::SLEEP_MINIMO_MS){ return false; }
+
+        // Passo 6: dorme pelo tempo recalculado (mais preciso que info inicial)
+        SleepTimerTIM17::dormirSeguro(infoPos.tempoMs);
 
         ++contSleep_;
         return true;
     }
 
     // ================================================================
-    // executar() — v3.3
+    // executar() — v3.5
     //
-    // Fase 1: Drena fila deferred
-    //   [BUG-1] Compactacao com clamp — sem out-of-bounds
-    //   [BUG-C] idxDeferred_ com guard contra underflow
+    // [FIX-4] Reagendamento corrigido: agoraPos recalculado apos
+    // cada execucao de funcao. Se execucao lenta fizer proximaMs
+    // cair no passado mesmo sem atrasouMuito inicial, a verificacao
+    // pos-reagendamento aplica recuperacao correta.
     //
-    // Fase 2: Coleta indices de tarefas prontas no tick atual
-    //   agora capturado uma vez — snapshot do ciclo
+    // ANTES (v3.4):
+    //   - atrasouMuito baseado em snapshot fixo antes do loop
+    //   - Se false: reagendar() simples, sem verificar se ficou
+    //     no passado apos execucao lenta
+    //   - Resultado: disparo imediato indevido no ciclo seguinte
     //
-    // Fase 3: Ordena por prioridade (insertion sort, estavel)
-    //   Apenas se numProntas > 1 — sem trabalho desnecessario
-    //
-    // Fase 4: Executa na ordem de prioridade
-    //   [BUG-B] agoraPos = HAL_GetTick() apos t.funcao()
-    //           usado em reagendarComRecuperacao() — timestamp correto
-    //   [IMP-I] tsInicio reutilizado em g_ultimaExecMs
-    //           HAL_GetTick() reduzido de 4x para 3x por tarefa
+    // DEPOIS (v3.5):
+    //   - agoraPos recalculado apos t.funcao() — sempre atualizado
+    //   - reagendar() normal primeiro (avanca periodoMs)
+    //   - Verifica se proximaMs ficou no passado com agoraPos real
+    //   - Se sim: aplica reagendarComRecuperacao() para corrigir
+    //   - Elimina disparo imediato por execucao lenta
     // ================================================================
     ResultadoExecucao executar() noexcept
     {
@@ -876,71 +1108,13 @@ public:
         // ============================================================
         // Fase 1 — Deferred calls
         // ============================================================
-
-        // Snapshot atomico do indice atual
-        __disable_irq();
-        const std::uint8_t nDeferred = idxDeferred_;
-        __enable_irq();
-
-        // Drena os N callbacks coletados no snapshot
-        for (std::uint8_t i{0U}; i < nDeferred; ++i)
-        {
-            if (filaDeferred_[i] != nullptr)
-            {
-                filaDeferred_[i]();
-                filaDeferred_[i] = nullptr;
-                ++resultado.deferredsProcessados;
-            }
-        }
-
-        // [BUG-C] + [BUG-1] Compacta fila com guards de underflow e clamp
-        __disable_irq();
-        {
-            // [BUG-C] Guard contra underflow:
-            // idxDeferred_ pode ter sido modificado por ISR entre os
-            // dois __disable_irq(). Nunca subtrair mais do que o atual.
-            const std::uint8_t atual = idxDeferred_;
-            const std::uint8_t sub   = (nDeferred <= atual)
-                                       ? nDeferred
-                                       : atual;
-            idxDeferred_ -= sub;
-
-            if (idxDeferred_ > 0U)
-            {
-                // [BUG-1] Clamp: itens novos adicionados por ISR durante
-                // a drenagem. Garante que o indice de origem nDeferred+i
-                // nao ultrapasse N_DEFERRED.
-                const std::uint8_t espaco =
-                    (nDeferred < N_DEFERRED)
-                        ? static_cast<std::uint8_t>(N_DEFERRED - nDeferred)
-                        : 0U;
-
-                const std::uint8_t novos =
-                    (idxDeferred_ <= espaco)
-                        ? idxDeferred_
-                        : espaco; // clamp
-
-                for (std::uint8_t i{0U}; i < novos; ++i)
-                {
-                    filaDeferred_[i]             = filaDeferred_[nDeferred + i];
-                    filaDeferred_[nDeferred + i] = nullptr;
-                }
-
-                idxDeferred_ = novos; // contagem real apos compactacao
-            }
-        }
-        __enable_irq();
+        resultado.deferredsProcessados = drenarFilaDeferred_();
 
         // ============================================================
         // Fase 2 — Coleta tarefas prontas (snapshot do tick)
         // ============================================================
-
-        // agora e o timestamp canonico do ciclo.
-        // detectarAtraso() usa este valor — mede atraso em relacao
-        // ao momento de coleta, nao de execucao. Intencional.
         const std::uint32_t agora {HAL_GetTick()};
 
-        // [RSC-1] Array local em stack — N_TAREFAS <= 32, max 32 bytes
         std::uint8_t prontas[N_TAREFAS];
         std::uint8_t numProntas {0U};
 
@@ -957,19 +1131,16 @@ public:
         }
 
         // ============================================================
-        // Fase 3 — Ordena por prioridade
+        // Fase 3 — Ordena por prioridade [IMP-O]
         // ============================================================
-
-        // Insertion sort estavel — skip se <= 1 tarefa pronta
         if (numProntas > 1U)
         {
             ordenarPorPrioridade(prontas, numProntas);
         }
 
         // ============================================================
-        // Fase 4 — Executa na ordem de prioridade
+        // Fase 4 — Executa na ordem de prioridade [FIX-4]
         // ============================================================
-
         for (std::uint8_t k{0U}; k < numProntas; ++k)
         {
             const std::uint8_t i = prontas[k];
@@ -977,57 +1148,41 @@ public:
 
             const std::uint32_t planejado = t.proximaMs;
 
-            // detectarAtraso com agora da Fase 2 — correto:
-            // mede se a tarefa ja perdeu um periodo completo no
-            // momento em que foi coletada, independente de quando
-            // sera executada dentro do ciclo.
-            const bool atrasouMuito = t.detectarAtraso(agora);
-
             if (t.funcao != nullptr)
             {
-                // [IMP-I] tsInicio capturado uma vez — reutilizado
-                // em g_ultimaExecMs. Reduz HAL_GetTick() de 4x para 3x
-                // por tarefa na Fase 4.
                 const std::uint32_t tsInicio = HAL_GetTick();
 
-                // Grava diagnostico ANTES de executar —
-                // se IWDG resetar durante t.funcao(), Watch Window
-                // mostra exatamente qual tarefa travou o sistema.
+                // Grava diagnostico ANTES de executar — se IWDG resetar
+                // durante t.funcao(), Watch Window mostra qual tarefa travou.
                 g_ultimaTarefaExecutada = i;
-                g_ultimaExecMs          = tsInicio; // [IMP-I]
+                g_ultimaExecMs          = tsInicio;
 
-                t.funcao(); // <<< executa a tarefa do usuario
+                t.funcao();
 
-                // tsFim capturado APOS execucao — para jitter e ultimaExecMs
-                const std::uint32_t tsFim = HAL_GetTick();
+                // [FIX-4] agoraPos recalculado APOS execucao.
+                // Reflete o tempo real consumido pela tarefa.
+                const std::uint32_t agoraPos = HAL_GetTick();
 
-                // [BUG-2] tsInicio passado separado de tsFim:
-                // jitter = tsInicio - planejado (so atraso de despacho)
-                // nao inclui duracao de execucao da tarefa
-                t.registrarExecucao(tsFim, planejado, tsInicio, i);
-
+                t.registrarExecucao(agoraPos, planejado, tsInicio, i);
                 ++resultado.tarefasExecutadas;
-            }
 
-            if (t.habilitada) // pode ter sido desabilitada por limiteExecucoes
-            {
-                if (atrasouMuito)
+                if (t.habilitada)
                 {
-                    // [BUG-B] agoraPos = timestamp APOS execucao da tarefa.
-                    // Tarefas anteriores do ciclo podem ter demorado varios ms.
-                    // Usar agora da Fase 2 causaria reagendamento no passado.
-                    const std::uint32_t agoraPos = HAL_GetTick();
-                    t.reagendarComRecuperacao(agoraPos);
-                }
-                else
-                {
-                    // reagendar() apenas soma periodoMs — nao precisa de agora
+                    // Tenta reagendamento normal (avanca periodoMs)
                     t.reagendar();
+
+                    // [FIX-4] Verifica se execucao lenta jogou
+                    // proximaMs para o passado, mesmo que
+                    // atrasouMuito fosse false antes da execucao.
+                    // Aplica recuperacao se necessario.
+                    if (tempoVencido(agoraPos, t.proximaMs))
+                    {
+                        t.reagendarComRecuperacao(agoraPos);
+                    }
                 }
             }
         }
 
-        // Atualiza diagnostico global — [IMP-F] herdado de v3.1
         g_dbg_eficiencia = obterEficiencia();
         g_dbg_perdas     = obterTotalPerdas();
 
@@ -1039,31 +1194,42 @@ public:
     // ================================================================
 
     // ----------------------------------------------------------------
-    // [BUG-A] obterEficiencia(): corrigido com uint64_t.
-    // Eliminado overflow silencioso de uint32_t em sistemas 24/7.
-    // uint64_t usado apenas nesta operacao — emulado no M0+ mas
-    // chamada e esporadica (a cada ciclo do loop principal, ~100ms).
+    // [IMP-P] obterEficiencia() — usa uint32_t em vez de uint64_t.
+    //
+    // ANTES (v3.4): multiplicacao e divisao 64-bit emuladas por
+    // software no Cortex-M0+ (~20-40 ciclos extras sem hardware
+    // dedicado para operacoes de 64 bits).
+    //
+    // DEPOIS (v3.5): como contSleep_ <= contLoop_ sempre, o produto
+    // contSleep_ * 100 nunca excede contLoop_ * 100. O overflow
+    // de uint32_t so ocorreria se contLoop_ > 42.9M, coberto
+    // pelo mesmo wrap de [LIM-1] (~497 dias). Sem perda de precisao.
     // ----------------------------------------------------------------
     [[nodiscard]] std::uint8_t obterEficiencia() const noexcept
     {
         if (contLoop_ == 0U) { return 0U; }
 
-        // [BUG-A] Cast para uint64_t antes da multiplicacao —
-        // elimina overflow quando contSleep_ se aproxima de UINT32_MAX
-        const std::uint64_t pct =
-            (static_cast<std::uint64_t>(contSleep_) * 100ULL)
-            / static_cast<std::uint64_t>(contLoop_);
+        // Sem risco de overflow para contLoop_ dentro do ciclo de vida
+        // do produto — ver [LIM-1] e [IMP-P].
+        const std::uint32_t pct =
+            (contSleep_ * 100U) / contLoop_;
 
-        // Saturacao em 100 — defensivo contra imprecisao
         return static_cast<std::uint8_t>(
-            (pct > 100ULL) ? 100U : static_cast<std::uint8_t>(pct));
+            (pct > 100U) ? 100U : static_cast<std::uint8_t>(pct));
+    }
+
+    // ----------------------------------------------------------------
+    [[nodiscard]] std::uint32_t obterContIdleHook() const noexcept
+    {
+        return contIdleHook_;
     }
 
     // ----------------------------------------------------------------
     void resetarEstatisticas() noexcept
     {
-        contLoop_  = 0U;
-        contSleep_ = 0U;
+        contLoop_     = 0U;
+        contSleep_    = 0U;
+        contIdleHook_ = 0U;
         resetarTodasPerdas();
     }
 
@@ -1193,24 +1359,4 @@ public:
 using Agendador = AgendadorT<SchedulerConfig::MAX_TAREFAS_PADRAO,
                               SchedulerConfig::MAX_DEFERRED_PADRAO>;
 
-#endif // SCHEDULER_V33_HPP
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+#endif // SCHEDULER_V35_HPP

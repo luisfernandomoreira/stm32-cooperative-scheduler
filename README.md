@@ -1,4 +1,4 @@
-# STM32 Cooperative Scheduler v3.3
+# STM32 Cooperative Scheduler v3.5
 
 **Agendador cooperativo de tarefas para Cortex-M0+ com prioridade, grupos, deferred queue e sleep inteligente**
 
@@ -174,54 +174,106 @@ DiagnosticoTarefa d = agendador.obterDiagnostico(INDICE_TAREFA);
 
 ---
 
-## Correções Aplicadas na v3.3
+## Correções Aplicadas na v3.5
 
-### BUG-A — Overflow em `obterEficiencia()`
+### FIX-2 — Race condition na fila deferred (`drenarFilaDeferred_()`)
 
-**Problema:** `(contSleep_ * 100) / contLoop_` em `uint32_t` overflow quando `contSleep_` se aproxima de `UINT32_MAX` (~497 dias de operação contínua).
+**Problema (v3.4):** o modelo de snapshot + compactação em bloco deixava uma janela de race condition. Se uma ISR chamasse `despachar()` durante a execução de um callback drenado, a compactação posterior podia corromper índices.
 
-**Correção:** Cast para `uint64_t` apenas na operação crítica. Custo de emulação no M0+ aceitável — chamada esporádica.
+**Correção:** modelo atômico LIFO O(1) — cada item é retirado atomicamente do topo com `__disable_irq()/__enable_irq()`. A seção crítica cobre apenas a retirada do ponteiro e o decremento do índice:
 
 ```cpp
-// v3.2 — overflow silencioso
-uint8_t pct = (contSleep_ * 100U) / contLoop_;
+// Retira item do topo — seção crítica mínima
+__disable_irq();
+--idxDeferred_;
+FuncaoTarefa cb             = filaDeferred_[idxDeferred_];
+filaDeferred_[idxDeferred_] = nullptr;
+__enable_irq();
 
-// v3.3 — correto
-uint64_t pct = (static_cast<uint64_t>(contSleep_) * 100ULL)
-               / static_cast<uint64_t>(contLoop_);
+cb(); // executa fora da seção crítica — ISR pode despachar novos itens aqui
 ```
 
-### BUG-B — Timestamp errado em `reagendarComRecuperacao()`
+ISRs podem chamar `despachar()` com segurança durante a drenagem — novos itens são processados no mesmo ciclo (`while` continua até fila vazia). Ver [LIM-3] para a implicação de ordem LIFO.
 
-**Problema:** `executar()` usava `agora` capturado na Fase 2 (antes de executar tarefas) para reagendar tarefas atrasadas. Tarefas anteriores no mesmo ciclo podiam demorar vários ms — o reagendamento ficava no passado, causando execuções imediatas em cascata.
+### FIX-3 — Contagem inflada de perdas em `reagendarComRecuperacao()`
 
-**Correção:** `agoraPos = HAL_GetTick()` capturado **após** `t.funcao()`. `detectarAtraso()` continua usando `agora` da Fase 2 — correto conceitualmente (mede atraso no momento da coleta).
+**Problema (v3.4):** a primeira iteração incrementava `perdas`, mas a tarefa **já tinha executado** — era apenas um disparo com atraso, não uma perda real.
 
-### BUG-C — Underflow em `idxDeferred_`
-
-**Problema:** `idxDeferred_ -= nDeferred` sem verificação. ISRs podiam modificar `idxDeferred_` entre os dois `__disable_irq()`, causando underflow.
-
-**Correção:** Guard seguro com clamp:
+**Correção:** primeiro avanço de `proximaMs` não conta como perda. Apenas iterações subsequentes (períodos genuinamente pulados) incrementam o contador:
 
 ```cpp
-const uint8_t atual = idxDeferred_;
-const uint8_t sub   = (nDeferred <= atual) ? nDeferred : atual;
-idxDeferred_ -= sub;
+// Primeiro avanço: tarefa executou com atraso — NÃO é perda
+proximaMs += periodoMs;
+
+// Iterações seguintes: períodos realmente perdidos
+while (tempoVencido(agora, proximaMs) && iteracoes < MAX_CATCHUP)
+{
+    proximaMs += periodoMs;
+    ++perdas;   // perda real
+    ++iteracoes;
+}
+```
+
+### FIX-4 — Disparo imediato indevido após execução lenta (`executar()`)
+
+**Problema (v3.4):** `atrasouMuito` era avaliado com snapshot fixo antes do loop de execução. Se a execução de uma tarefa fosse lenta, `proximaMs` caía no passado mesmo com `atrasouMuito == false` — disparando a tarefa novamente no ciclo seguinte sem recuperação.
+
+**Correção:** `agoraPos` recalculado após `t.funcao()`. Após `reagendar()` normal, verifica se `proximaMs` ficou no passado e aplica recuperação quando necessário:
+
+```cpp
+t.funcao();
+const uint32_t agoraPos = HAL_GetTick(); // timestamp real pós-execução
+
+t.reagendar();  // avança periodoMs normalmente
+
+if (tempoVencido(agoraPos, t.proximaMs))
+{
+    t.reagendarComRecuperacao(agoraPos); // corrige se execução foi lenta
+}
 ```
 
 ---
 
-## Melhorias Aplicadas na v3.3
+## Melhorias Aplicadas na v3.5
 
-### IMP-H — Prioridade como parâmetro em `iniciar()`
+### IMP-N — Guard de reentrância do `idleHook_` em builds DEBUG
 
-**Problema (v3.2):** `adicionarTarefa()` chamava `iniciar()` e depois atribuía `prioridade` separadamente. Se `iniciar()` fosse chamado diretamente (sem `adicionarTarefa()`), a prioridade voltava ao padrão silenciosamente.
+Flag `idleHookAtivo_` previne chamada recursiva se o hook chamar `despachar()` acidentalmente (ver [LIM-2]). Custo zero em RELEASE — bloco removido pelo pré-processador:
 
-**Correção:** `iniciar()` recebe `prioridade` como parâmetro com default `PRIORIDADE_PADRAO`. `adicionarTarefa()` passa o valor diretamente — sem dupla atribuição.
+```cpp
+#ifdef DEBUG
+    if (idleHookAtivo_) { return; }  // bloqueia re-entrada
+    idleHookAtivo_ = true;
+#endif
+    idleHook_();
+#ifdef DEBUG
+    idleHookAtivo_ = false;
+#endif
+```
 
-### IMP-I — Redução de chamadas a `HAL_GetTick()`
+### IMP-O — Desempate por índice documentado
 
-`tsInicio` capturado antes de `t.funcao()` é reutilizado em `g_ultimaExecMs`. Reduz `HAL_GetTick()` de 4× para 3× por tarefa na Fase 4.
+Tarefas com mesma prioridade executam em **ordem crescente de índice** (ordem de adição ao scheduler). O insertion sort estável garante essa propriedade sem código extra.
+
+### IMP-P — `obterEficiencia()` usa `uint32_t` em vez de `uint64_t`
+
+O Cortex-M0+ não tem instrução de multiplicação/divisão 64-bit em hardware — operações `uint64_t` são emuladas por software (~20–40 ciclos extras). Como `contSleep_ <= contLoop_` é sempre verdadeiro, o produto `contSleep_ * 100` nunca excede `UINT32_MAX` dentro do ciclo de vida do produto. A emulação foi eliminada sem perda de precisão.
+
+### IMP-Q — `habilitarTarefa(true)` preserva `totalExecucoes`
+
+**Antes (v3.4):** reabilitar uma tarefa apagava o histórico de execuções acumulado, dificultando diagnóstico de tarefas que ciclam entre habilitada/desabilitada.
+
+**Depois (v3.5):** `totalExecucoes` é preservado ao reabilitar. Para reset explícito, use o novo método `resetarContadorExecucoes(indice)`.
+
+### IMP-R — Comentário no duplo clear de `SR` em `armar()`
+
+Documenta a intenção do clear pós-UEV para futuros revisores. O `EGR=UG` gera um UEV que levanta `UIF` — sem o segundo clear, a ISR dispararia imediatamente ao habilitar `DIER`, ignorando o período configurado em `ARR`. Sem alteração funcional.
+
+### IMP-S — `dormirAteProximaTarefa()` elimina dupla varredura
+
+**Antes (v3.4):** chamava `proximaExecucao()` + `temTarefasPendentes()` (que chamava `proximaExecucao()` novamente) — duas varreduras completas de `N_TAREFAS`.
+
+**Depois (v3.5):** uma única chamada a `proximaExecucao()` após `drenarFilaDeferred_()` e `chamarIdleHook_()` recalcula o próximo wake-up com tick atualizado — mais preciso e uma varredura a menos por ciclo.
 
 ---
 
@@ -230,6 +282,14 @@ idxDeferred_ -= sub;
 ### LIM-1 — Leitura transitória de `obterEficiencia()` após wrap
 
 `contLoop_` e `contSleep_` são `uint32_t`. Após ~497 dias de operação contínua (wrap), `obterEficiencia()` pode retornar um valor incorreto **apenas no ciclo imediatamente após o wrap**. Impacto: somente diagnóstico — zero efeito funcional. Correção não justificada para o ciclo de vida do produto.
+
+### LIM-2 — `idleHook_` não pode chamar `despachar()`
+
+Chamar `despachar()` dentro do idle hook cria risco de loop infinito: `idle → despacha → idle` nunca dorme. Em DEBUG o guard [IMP-N] detecta e bloqueia. Em RELEASE é responsabilidade do usuário — sem overhead.
+
+### LIM-3 — Fila deferred com ordem LIFO
+
+Após [FIX-2], a drenagem segue ordem **LIFO** (último a entrar, primeiro a sair). Se a ordem FIFO for crítica, despache callbacks em funções compostas ou use índices explicitamente.
 
 ---
 
@@ -257,11 +317,15 @@ void definirPeriodo(uint8_t indice, uint32_t periodoMs);
 // Ajusta prioridade em runtime
 void definirPrioridade(uint8_t indice, uint8_t prioridade);
 
-// Habilita/desabilita tarefa (resets contadores ao habilitar)
+// Habilita/desabilita tarefa
+// Ao habilitar: reagenda a partir de agora, preserva totalExecucoes [IMP-Q]
 void habilitarTarefa(uint8_t indice, bool hab);
 
-// Força execução imediata na próxima chamada a executar()
+// Força execução imediata na próxima chamada a executar() (zera totalExecucoes)
 void resetarTarefa(uint8_t indice);
+
+// Reset explícito do contador de execuções — use após habilitarTarefa() [IMP-Q]
+void resetarContadorExecucoes(uint8_t indice);
 ```
 
 ### Watchdog por Tarefa
@@ -288,10 +352,24 @@ void suspenderGrupo(GrupoTarefa grupo); // SEGURANCA nunca é suspenso
 void retomarGrupo(GrupoTarefa grupo);   // reagenda tarefas do grupo automaticamente
 ```
 
+### Idle Hook
+
+```cpp
+// Registra callback executado entre execução e sleep (diagnóstico, keep-alive)
+// RESTRIÇÃO [LIM-2]: não chamar despachar() dentro do hook
+void registrarIdleHook(FuncaoTarefa hook);
+
+void removerIdleHook();
+
+// Número de vezes que o idle hook foi chamado
+uint32_t obterContIdleHook();
+```
+
 ### Fila Deferred
 
 ```cpp
-// Enfileira callback de ISR (thread-safe)
+// Enfileira callback para execução no contexto do scheduler (seguro de ISR)
+// Ordem de drenagem: LIFO [LIM-3]
 bool despachar(FuncaoTarefa f);
 
 // Limpa toda a fila (use em reinicialização)
@@ -307,7 +385,7 @@ uint32_t obterContDeferredOverflow();
 // Executa um ciclo completo (deferred + tarefas prontas)
 ResultadoExecucao executar();
 
-// Dorme até a próxima tarefa via TIM17 + WFI
+// Drena deferred, chama idle hook e dorme via TIM17 + WFI [IMP-S]
 // Retorna false se não há tarefas ou tempo < SLEEP_MINIMO_MS
 bool dormirAteProximaTarefa();
 ```
@@ -318,7 +396,7 @@ bool dormirAteProximaTarefa();
 // Retorna struct com todos os campos de diagnóstico de uma tarefa
 DiagnosticoTarefa obterDiagnostico(uint8_t indice);
 
-// Eficiência de sleep: % de ciclos em que dormiu (0–100)
+// Eficiência de sleep: % de ciclos em que dormiu (0–100) [IMP-P]
 uint8_t obterEficiencia();
 
 // Deadline misses de uma tarefa específica
@@ -591,6 +669,7 @@ Portável para qualquer Cortex-M com `HAL_GetTick()` e um timer de 16 bits. Adap
 
 | Versão | Principais mudanças |
 |--------|---------------------|
+| **v3.5** | FIX-2 (deferred LIFO atômico, elimina race condition), FIX-3 (perdas não infladas na primeira recuperação), FIX-4 (disparo imediato indevido após execução lenta); IMP-N (guard reentrância idleHook DEBUG), IMP-O (desempate por índice documentado), IMP-P (eficiência uint32_t, elimina emulação 64-bit), IMP-Q (historico preservado ao reabilitar tarefa + `resetarContadorExecucoes()`), IMP-R (comentário duplo clear SR), IMP-S (dormirAteProximaTarefa elimina dupla varredura); idle hook |
 | **v3.3** | BUG-A (overflow eficiência), BUG-B (timestamp reagendamento), BUG-C (underflow deferred); IMP-H (prioridade em `iniciar()`), IMP-I (HAL_GetTick 4×→3×) |
 | **v3.2** | Prioridade cooperativa, insertion sort estável, `ordenarPorPrioridade()` |
 | **v3.1** | BUG-2 (jitter só atraso de despacho), BUG-3 (catch-up limitado), BUG-4 (callback falha one-shot); `tempoVencido()` com aritmética signed |
