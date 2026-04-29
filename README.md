@@ -105,7 +105,7 @@ Agendador::instancia().despachar(minhaTarefaDeISR);
 - Capacidade: `N_DEFERRED` callbacks (default: 4)
 - Seção crítica com `__disable_irq()/__enable_irq()` — atômico
 - Overflow contado em `contDeferredOverflow_` — diagnóstico sem crash
-- Compactação automática após drenagem — slots reutilizados
+- Drenagem LIFO O(1) após [FIX-2] — sem janela de race condition
 
 ### Sleep Inteligente via TIM17 + WFI
 
@@ -290,6 +290,300 @@ Chamar `despachar()` dentro do idle hook cria risco de loop infinito: `idle → 
 ### LIM-3 — Fila deferred com ordem LIFO
 
 Após [FIX-2], a drenagem segue ordem **LIFO** (último a entrar, primeiro a sair). Se a ordem FIFO for crítica, despache callbacks em funções compostas ou use índices explicitamente.
+
+---
+
+## Fila Deferred — Explicação Completa
+
+### O problema que ela resolve
+
+Em sistemas embarcados, interrupções (ISRs) precisam ser **rápidas e simples**. Uma ISR que acessa hardware, grava na Flash ou processa lógica complexa cria três problemas sérios:
+
+```
+  Problema 1 — Latência de outras IRQs
+  ─────────────────────────────────────
+  ISR de UART faz lógica pesada (~5 ms)
+  → IRQ de SysTick atrasada → HAL_GetTick() perde ticks
+  → Todos os timings do sistema ficam errados
+
+  Problema 2 — Dados inconsistentes
+  ────────────────────────────────────
+  ISR modifica struct compartilhada enquanto
+  o loop principal está na metade de uma leitura
+  → leitura vê estado parcialmente atualizado (corrompido)
+
+  Problema 3 — Bloqueio proibido em ISR
+  ──────────────────────────────────────
+  ISR chama taskGerenciarFlash() → erase de Flash leva ~40 ms
+  → CPU presa na ISR por 40 ms
+  → UART perde bytes, SysTick perde ticks, IWDG não alimentado
+```
+
+A solução é o padrão **"ISR delega, task executa"**: a ISR apenas registra o evento e retorna imediatamente. O trabalho pesado fica para o contexto do scheduler.
+
+### O que é a Fila Deferred
+
+É um array circular de ponteiros de função (`FuncaoTarefa`) dentro do `AgendadorT`. Quando uma ISR precisa acionar processamento:
+
+1. **ISR**: chama `despachar(minhFuncao)` — adiciona o ponteiro à fila e retorna em nanossegundos
+2. **Scheduler**: no próximo ciclo de `executar()`, drena a fila **antes** das tarefas periódicas
+
+```
+  CONTEXTO DE IRQ (prioridade alta)          CONTEXTO DO SCHEDULER (loop)
+  ─────────────────────────────────          ──────────────────────────────
+
+  void UART_IRQHandler()                     void executar()
+  {                                          {
+    // processa 1 byte (rápido)                // Fase 1: deferred ANTES das tasks
+    uart.rxCallback(byte);                     drenarFilaDeferred_();
+                                               //  └─ chama processarUART()
+    // delega o trabalho pesado                //     com IRQs habilitadas
+    agendador.despachar(processarUART);
+    // retorna em ~50 ns                       // Fase 2: tarefas periódicas
+  }                                            executarTarefasPeridicas_();
+                                             }
+```
+
+### Proteção contra race condition — modelo LIFO atômico (FIX-2)
+
+O ponto crítico é que a ISR pode chamar `despachar()` **a qualquer momento**, inclusive durante a própria drenagem da fila. O modelo adotado na v3.5 resolve isso com retirada atômica O(1):
+
+```
+  Estado da fila antes da drenagem:
+  ┌─────┬─────┬─────┬─────┐
+  │ fn0 │ fn1 │ fn2 │  -  │  idxDeferred_ = 3
+  └─────┴─────┴─────┴─────┘
+     0     1     2     3
+
+  Ciclo de drenagem (while fila não vazia):
+
+  Iteração 1:
+    __disable_irq()          ← seção crítica mínima
+    idx = --idxDeferred_     → idx = 2
+    cb = filaDeferred_[2]    → cb = fn2
+    filaDeferred_[2] = null
+    __enable_irq()           ← IRQ pode inserir aqui — slot 2 está livre
+    cb()                     ← executa fn2 com IRQs habilitadas
+
+  Iteração 2:
+    __disable_irq()
+    idx = --idxDeferred_     → idx = 1
+    cb = filaDeferred_[1]    → cb = fn1
+    filaDeferred_[1] = null
+    __enable_irq()
+    cb()                     ← executa fn1
+
+  ISR interrompe durante cb():
+    despachar(fn3)           → filaDeferred_[1] = fn3, idxDeferred_ = 2
+    retorna
+
+  Iteração 3 (fila não estava vazia — fn3 foi adicionada):
+    __disable_irq()
+    idx = --idxDeferred_     → idx = 1
+    cb = filaDeferred_[1]    → cb = fn3   ← novo item processado no mesmo ciclo!
+    ...
+```
+
+A seção crítica cobre **apenas** a retirada do ponteiro (~3 instruções Cortex-M0+). A execução do callback acontece com IRQs habilitadas — o sistema responde normalmente durante o processamento.
+
+### Overflow da fila — sem crash, com diagnóstico
+
+Se a ISR tentar inserir mais callbacks do que o limite `N_DEFERRED`:
+
+```cpp
+bool despachar(FuncaoTarefa f) noexcept
+{
+    __disable_irq();
+    const bool fila_cheia = (idxDeferred_ >= N_DEFERRED);
+    if (!fila_cheia) {
+        filaDeferred_[idxDeferred_++] = f;
+    } else {
+        ++contDeferredOverflow_;  // conta sem crash
+    }
+    __enable_irq();
+    return !fila_cheia;
+}
+```
+
+O retorno `bool` indica se o despacho teve sucesso. `contDeferredOverflow_` cresce sem travar o sistema — o desenvolvedor vê o número no debugger e ajusta `N_DEFERRED`.
+
+### Ordem de execução: LIFO
+
+Após o FIX-2, a fila segue ordem **LIFO** (último a entrar, primeiro a sair). Na maioria dos casos de uso em sistemas embarcados isso é irrelevante — a ISR despacha apenas uma função por evento. Se a ordem FIFO for necessária, despache uma única função composta:
+
+```cpp
+// Em vez de despachar A e depois B separadamente:
+void processar_A_e_B() { processar_A(); processar_B(); }
+agendador.despachar(processar_A_e_B);  // ordem garantida
+```
+
+---
+
+## Sleep Inteligente — Explicação Completa
+
+### O problema: polling consome energia e gera ruído
+
+O loop mais simples possível:
+
+```cpp
+while (true)
+{
+    ag.executar();   // 1 ms de trabalho real
+    // próxima tarefa só em 99 ms... mas a CPU fica rodando!
+}
+```
+
+Com esse modelo, a CPU executa bilhões de instruções vazias entre uma tarefa e outra. O resultado:
+
+```
+  Consumo típico Cortex-M0+ em Run mode:    ~3–4 mA @ 24 MHz
+  Consumo em Sleep (WFI):                   ~0,8–1,5 mA
+  Com 99% do tempo em sleep:                média ~1 mA
+  Redução de consumo:                       ~65–75%
+```
+
+Além do consumo, o CPU em plena execução irradia **harmônicos de clock** — energia eletromagnética na frequência do oscilador e seus múltiplos. Em produtos com certificação INMETRO/ANATEL, isso pode reprovar o produto nos testes de EMC.
+
+### WFI — Wait For Interrupt
+
+`WFI` é uma instrução do Cortex-M que coloca o núcleo em modo **Sleep** imediatamente. O CPU para de executar instruções e reduz o consumo. Apenas uma interrupção o acorda.
+
+```
+  CPU executando:
+  ─────┬────────────────────────────────────────┬──────►
+       │          __WFI()                       │ IRQ acorda
+       │                                        │
+       └────────── CPU em Sleep ────────────────┘
+         clock interno parado, periféricos ativos
+         SysTick continua → HAL_GetTick() funciona
+         UART RX continua → bytes recebidos normalmente
+         IWDG continua    → countdown prossegue
+```
+
+O problema do `WFI` sozinho: **acordar na hora certa**. Se não houver IRQ programada, o CPU dorme para sempre (ou até o IWDG resetar).
+
+### TIM17 como alarme de wake-up
+
+O `TIM17` é configurado como **one-shot** (`OPM = 1`): conta até `ARR`, gera uma interrupção e para sozinho. O scheduler o usa como alarme:
+
+```
+  dormirAteProximaTarefa():
+
+  1. Calcula tempo até próxima tarefa: N ms
+
+  2. Configura TIM17:
+     PSC = 23999  →  clock do timer = 1 kHz (1 tick = 1 ms)
+     ARR = N - 1  →  conta N ms e para
+     OPM = 1      →  one-shot (para após o evento)
+     UIE = 1      →  gera IRQ ao expirar
+     CEN = 1      →  inicia contagem
+
+  3. CPU executa WFI → dorme
+
+  4. TIM17 expira após N ms → IRQ acorda CPU
+     ISR: g_schedulerSleepExpired = 1U
+
+  5. CPU retorna do WFI → loop encerra → próxima tarefa executa
+```
+
+### Race condition e como é resolvida
+
+Existe uma janela perigosa entre armar o TIM17 e executar o WFI:
+
+```
+  PROBLEMA (código ingênuo):
+
+  armar(N);         ← TIM17 começa a contar
+                    ← IRQ do TIM17 dispara AQUI (N muito pequeno)
+                    ← g_schedulerSleepExpired = 1
+  __WFI();          ← CPU entra em sleep com a flag já setada
+                    ← Nenhuma outra IRQ programada
+                    ← CPU dorme indefinidamente!  ← BUG
+```
+
+A solução é o padrão canônico do Cortex-M — verificar a flag **com IRQs desabilitadas**:
+
+```cpp
+void dormirSeguro(uint32_t ms) noexcept
+{
+    armar(ms);              // (1) arma TIM17, zera a flag
+
+    __disable_irq();        // (2) para o mundo — nenhuma IRQ executará agora
+
+    if (g_schedulerSleepExpired == 0U)
+    {
+        // Flag ainda não setada — podemos dormir com segurança
+        __enable_irq();     // (3a) re-habilita IRQs
+        __WFI();            // (4a) dorme — se IRQ estava pendente,
+                            //           Cortex-M acorda IMEDIATAMENTE
+                            //           (pendente ≠ mascarada)
+    }
+    else
+    {
+        // TIM17 já expirou entre armar() e __disable_irq()
+        __enable_irq();     // (3b) só habilita — não dorme
+    }
+
+    parar();                // (5) para TIM17, desabilita IRQ
+}
+```
+
+O detalhe fundamental do Cortex-M: `__WFI()` acorda para IRQs **pendentes**, mesmo que estejam momentaneamente mascaradas. Então `__enable_irq()` + `__WFI()` são atômicos na prática — não existe janela entre eles.
+
+### O que permanece ativo durante o sleep
+
+```
+  ┌─────────────────────────────────────────────────────────┐
+  │                  CPU em WFI (Sleep)                     │
+  │                                                         │
+  │  ATIVO:                         PARADO:                 │
+  │  ✓ SysTick (1 ms)               ✗ Núcleo Cortex-M0+    │
+  │  ✓ UART RX (buffer circular)    ✗ Pipeline de instruções│
+  │  ✓ IWDG (countdown)             ✗ Busca de opcode       │
+  │  ✓ TIM17 (alarme de wake-up)                            │
+  │  ✓ GPIO (interrupções externas)                         │
+  │  ✓ DMA (se configurado)                                 │
+  └─────────────────────────────────────────────────────────┘
+```
+
+`HAL_GetTick()` continua correto durante o sleep porque o SysTick continua gerando IRQs de 1 ms. Cada IRQ acorda o CPU por ~10 ciclos para atualizar `uwTick` e retorna ao sleep.
+
+### Critério de sleep: 2 ms mínimo
+
+Configurar o TIM17 tem um custo de ~5–10 µs (habilitar clock, escrever registradores, configurar NVIC). Dormir menos de 2 ms não compensa:
+
+```
+  Overhead de setup TIM17:  ~5–10 µs
+  Benefício de 2 ms de sleep: ~2000 µs economia
+  Razão benefício/custo:       400:1 — vale muito a pena
+
+  Overhead de setup TIM17:  ~5–10 µs
+  Benefício de 1 µs de sleep: ~1 µs economia
+  Razão:                       0,1:1 — não compensa
+```
+
+Se `tempoMs < SLEEP_MINIMO_MS (2 ms)`, o scheduler não dorme — apenas retorna e a tarefa executa no próximo tick do `while`.
+
+### Visualização do ciclo completo
+
+```
+  t=0ms    t=1ms    t=17ms   t=34ms        t=100ms  t=117ms
+  │        │        │        │             │        │
+  ▼        ▼        ▼        ▼             ▼        ▼
+  ┌──┐     ┌──┐     ┌──┐     ┌──┐         ┌──┐     ┌──┐
+  │T0│     │S │     │T1│     │T2│         │T0│     │S │
+  └──┘     └──┘─────└──┘─────└──┘─────────└──┘     └──┘
+  exec   sleep        exec    exec         exec    sleep
+  ~1ms   ~16ms        ~1ms    ~1ms         ~1ms    ~83ms
+
+  T0 = taskAtualizaBotoes  (100ms, fase 0ms)
+  T1 = taskRecebeUART      (100ms, fase 17ms)
+  T2 = taskEnviaUART       (100ms, fase 34ms)
+  S  = CPU dormindo via TIM17 + WFI
+
+  Eficiência: (84ms sleep) / (100ms ciclo) = 84%
+  Com fases mais distribuídas e tarefas mais esparsas: ~99%
+```
 
 ---
 
