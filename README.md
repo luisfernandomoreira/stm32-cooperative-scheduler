@@ -339,6 +339,92 @@ uint32_t proximoTempoExecucao();
 
 ---
 
+## Design Pattern — Singleton (Meyers Singleton)
+
+### O que é
+
+O **Singleton** garante que uma classe tenha **exatamente uma instância** durante toda a vida do programa. A variante utilizada aqui é o **Meyers Singleton** — a forma mais simples, segura e eficiente em C++11/14:
+
+```cpp
+[[nodiscard]] static AgendadorT& instancia() noexcept
+{
+    static AgendadorT unicaInstancia;  // construído na 1ª chamada
+    return unicaInstancia;             // retorna referência — zero cópia
+}
+```
+
+A variável `static` local é inicializada **uma única vez**, na primeira chamada. O padrão C++11 garante que essa inicialização é thread-safe sem nenhum mutex manual.
+
+---
+
+### Por que Singleton tem menos overhead em sistemas embarcados
+
+#### 1. Zero alocação dinâmica — sem heap
+
+Em microcontroladores, `new`/`malloc` são proibidos ou perigosos: fragmentam a heap, têm latência imprevisível e podem falhar em runtime. O Meyers Singleton aloca o objeto no segmento **BSS/data** — determinado em tempo de link, custo zero em runtime:
+
+```
+┌──────────────────────────────────────┐
+│  RAM do STM32C031 (6 KB)             │
+│                                      │
+│  .bss / .data  ← AgendadorT aqui    │
+│  Stack          ← variáveis locais   │
+│  (sem heap)     ← não existe         │
+└──────────────────────────────────────┘
+```
+
+#### 2. Acesso por referência — zero indireção
+
+Um ponteiro global exige uma leitura de memória extra para desreferenciar. A referência retornada pelo Singleton é resolvida pelo compilador em tempo de compilação — o endereço vira constante no código gerado:
+
+```asm
+; Ponteiro global (2 instruções no Cortex-M0+):
+LDR  R0, [PC, #offset]   ; carrega endereço do ponteiro
+LDR  R1, [R0]            ; desreferencia
+
+; Singleton / referência (1 instrução):
+LDR  R0, [PC, #offset]   ; endereço do objeto direto — sem indireção
+```
+
+#### 3. Inicialização determinística
+
+Variáveis globais em C++ têm **ordem de inicialização indefinida** entre unidades de compilação (*Static Initialization Order Fiasco*). O Meyers Singleton inicializa o objeto **na primeira chamada**, garantindo que todas as dependências já existem no momento do uso.
+
+#### 4. Flash menor — sem runtime de heap
+
+Sem `new`/`delete`, o linker não inclui o código de gerenciamento de heap (`malloc`, `free`, controle de blocos livres). Em um MCU com 32 KB de Flash, isso representa centenas de bytes economizados.
+
+#### 5. Sem overhead após a primeira chamada
+
+O compilador (ARM Clang V6 com `-Os`) transforma o `static` local em uma flag de 1 bit no BSS. Após a inicialização, a flag nunca mais é falsa — o acesso se torna **uma única instrução de load**, equivalente a uma variável global:
+
+```asm
+; instancia() após a 1ª chamada — flag já setada, branch not taken
+LDR  R0, =_ZN10AgendadorTE   ; endereço do objeto estático
+BX   LR                       ; retorna referência
+```
+
+---
+
+### Comparativo de abordagens
+
+| Abordagem | Alocação | Indireção | Init. ordenada | Heap runtime | AUTOSAR |
+|-----------|----------|-----------|----------------|--------------|---------|
+| Variável global | BSS/data | Sim (ponteiro) | ❌ Indefinida | Não | ⚠️ ODR |
+| `new` / heap | Heap (runtime) | Sim | ❌ Manual | Sim | ❌ Proibido |
+| Passagem de parâmetro | Stack (ponteiro) | Sim | ✅ Manual | Não | ✅ |
+| **Meyers Singleton** | **BSS/data** | **Não** | **✅ Garantida** | **Não** | **✅** |
+
+---
+
+### Regra AUTOSAR aplicada
+
+> **AUTOSAR C++14 — A3-1-1:** *"It shall be possible to include any header file in multiple translation units without violating the One Definition Rule."*
+
+O Meyers Singleton coloca a definição do objeto dentro de uma função `inline` no header. Cada translation unit vê a mesma definição; o linker garante uma única instância. Sem violação de ODR.
+
+---
+
 ## Uso Mínimo
 
 ### 1. Definir variáveis de diagnóstico (`main.cpp`)
